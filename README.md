@@ -11,7 +11,7 @@
 ```text
 scores/
   <歌手>/
-    <曲名>_<档位>_<分数>分.py    # 唯一源码（纯 Python 数据文件，体积 <= 200 KB）
+    <曲名>_<档位>.py             # 唯一源码（纯 Python 数据文件，体积 <= 200 KB）
 inbox/
   <歌手>/                        # 可选：直接 PR 投递 .mid / .musicxml / .mxl 待转源码
 scripts/
@@ -27,8 +27,8 @@ index.json                       # 轻量索引（由 publish-library.yml 自动
 ## 工作流全貌（100% 纯 GitHub，零外置服务器）
 
 1. **导入练琴包一键去 GitHub 提 PR**：
-   - 在 [练习播放器](https://zxsos.github.io/guitar-tab-player/) 拖入包含 `score_data.py` 的 `.zip` 练习包后，系统会在浏览器本地自动校验声部、打分并对比 `index.json` 预判重；
-   - 未收录时点击 **「复制源码并去 GitHub 提 PR」**，自动复制标准化源码并打开 GitHub 新建文件页，选 *Create a new branch and start a pull request* 即可发起 PR；
+   - 在 [练习播放器](https://zxsos.github.io/guitar-tab-player/) 拖入包含 `score_data.py` 的 `.zip` 练习包后，系统会在浏览器本地自动解析把位/声部信息并对比 `index.json` 预判重；
+   - 未收录时点击 **「复制源码并去 GitHub 提 PR」**，自动复制标准化源码并打开 GitHub 新建文件页，选 *Create a new branch and start a pull request* 即可发起 PR（若你是仓库管理员，也可直接 Commit 到 `main`）；
    - 你也可以直接在 GitHub 本仓库 `scores/<歌手>/` 或 `inbox/<歌手>/` 上传文件发起 PR。
 2. **PR 自动质检与云端试编（`pr-check.yml`）**：
    - 仅持只读权限，运行静态 AST 与正则安全检查（禁止系统/网络/动态执行与本地路径泄露）；

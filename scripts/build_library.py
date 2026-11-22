@@ -35,7 +35,7 @@ TIER_LABELS: Dict[str, str] = {
 }
 LABEL_TO_TIER: Dict[str, str] = {v: k for k, v in TIER_LABELS.items()}
 
-FILENAME_RE = re.compile(r"^(?P<title>.+)_(?P<tierLabel>新手|标准|进阶)_(?P<score>\d{1,3})分$")
+FILENAME_RE = re.compile(r"^(?P<title>.+)_(?P<tierLabel>新手|标准|进阶)(?:_\d{1,3}分)?$")
 LEAK_REGEX = re.compile(r"(textedit://|/home/|/Users/|C:\\Users\\)", re.IGNORECASE)
 UNSAFE_PY_REGEX = re.compile(
     r"(\bos\.system\b|\bsubprocess\b|\bsocket\b|\burllib\b|\brequests\b|"
@@ -145,28 +145,21 @@ def _load_module_direct(py_path: Path) -> Any:
     return mod
 
 
-def analyze_and_score(
-    norm_text: str,
+def analyze_score_metadata(
     mod: Any,
     measures: List[Any],
     manifest: Dict[str, Any],
     *,
-    has_pdf: bool,
-    png_count: int,
     artist_hint: str = "",
     filename_stem: str = "",
 ) -> Dict[str, Any]:
-    """Infer artist/title/tier and compute deterministic 4-part score (0..100)."""
+    """Infer artist/title/tier and extract factual guitar/tab metrics."""
     title_from_name = ""
     tier_from_name = ""
-    score_from_name: Optional[int] = None
     m_fn = FILENAME_RE.match(filename_stem)
     if m_fn:
         title_from_name = m_fn.group("title").replace("_", " ").strip()
         tier_from_name = LABEL_TO_TIER.get(m_fn.group("tierLabel"), "")
-        raw_sc = int(m_fn.group("score"))
-        if 0 <= raw_sc <= 100:
-            score_from_name = raw_sc
 
     raw_artist = (
         str(getattr(mod, "ARTIST", "") or "").strip()
@@ -192,13 +185,11 @@ def analyze_and_score(
     bpm = int(getattr(mod, "TEMPO_BPM", manifest.get("bpm", 72) or 72))
 
     max_fret = 0
-    mel_count = 0
-    bass_count = 0
-    inner_count = 0
-    slap_count = 0
+    note_count = 0
     harm_count = 0
     pm_count = 0
     grace_count = 0
+    slap_count = 0
     link_count = 0
     arp_count = 0
     has_16th = False
@@ -206,11 +197,8 @@ def analyze_and_score(
     last_bar = measures[-1].bar if measures else 0
     active_mel: Optional[int] = None
     crossings = 0
-    bars_with_chords = 0
 
     for meas in measures:
-        if getattr(meas, "chords", None):
-            bars_with_chords += 1
         events = getattr(meas, "events", []) or []
         for ev_idx, e in enumerate(events):
             if getattr(e, "dur", 0) == 1:
@@ -241,17 +229,12 @@ def analyze_and_score(
                             crossings += 1
 
             for nt in notes:
+                note_count += 1
                 role = getattr(nt, "role", "melody")
                 is_harm = bool(getattr(nt, "harmonic", False))
                 if not is_harm and role != "slap" and nt.fret > max_fret:
                     max_fret = nt.fret
-                if role == "melody":
-                    mel_count += 1
-                elif role == "bass":
-                    bass_count += 1
-                elif role == "inner":
-                    inner_count += 1
-                elif role == "slap":
+                if role == "slap":
                     slap_count += 1
                 if is_harm:
                     harm_count += 1
@@ -286,56 +269,14 @@ def analyze_and_score(
         tier = "beginner"
 
     bar_count = max(len(measures), len(manifest.get("bars") or []))
-    # 1. Structure (0..30)
-    structure = 14 if bar_count >= 16 else (11 if bar_count >= 8 else (8 if bar_count >= 4 else 4))
-    if str(getattr(mod, "TITLE", "") or "").strip():
-        structure += 3
-    if str(getattr(mod, "ARTIST", "") or "").strip() or str(getattr(mod, "COMPOSER", "") or "").strip():
-        structure += 3
-    if getattr(mod, "TEMPO_BPM", None):
-        structure += 3
-    if hasattr(mod, "CAPO"):
-        structure += 2
-    chord_ratio = (bars_with_chords / len(measures)) if measures else 0.0
-    structure += 5 if chord_ratio >= 0.7 else (3 if chord_ratio >= 0.3 else (2 if chord_ratio > 0 else 0))
-
-    # 2. Voicing (0..30)
-    voicing = 18 if crossings == 0 else (12 if crossings <= 2 else max(0, 14 - crossings * 2))
-    tier_cap = 7 if tier == "beginner" else (12 if tier == "standard" else 15)
-    voicing += 12 if max_fret <= tier_cap else max(4, 12 - (max_fret - tier_cap) * 2)
-
-    # 3. Arrangement (0..25)
-    arrangement = 8 if (mel_count > 0 and bass_count > 0) else (4 if mel_count > 0 else 0)
-    if tier == "beginner":
-        arrangement += 4 + (7 if tech_variety <= 1 else 4)
-    else:
-        arrangement += 4 if inner_count > 0 else 2
-        arrangement += 7 if tech_variety >= 3 else (5 if tech_variety >= 1 else 2)
-    landmarks = getattr(mod, "LANDMARKS", None) or {}
-    if isinstance(landmarks, dict) and len(landmarks) > 0:
-        arrangement += 6
-    elif bar_count >= 12:
-        arrangement += 2
-
-    # 4. Bundle completeness (0..15)
     manifest_notes = manifest.get("notes") or []
-    bundle = 9 if len(manifest_notes) > 0 else (4 if len(manifest.get("bars") or []) > 0 else 0)
-    if has_pdf:
-        bundle += 3
-    if png_count > 0:
-        bundle += 3
-
-    auto_score = max(0, min(100, structure + voicing + arrangement + bundle))
-    final_score = score_from_name if score_from_name is not None else auto_score
-    total_notes = len(manifest_notes) if manifest_notes else (mel_count + bass_count + inner_count + slap_count)
+    total_notes = len(manifest_notes) if manifest_notes else note_count
 
     return {
         "artist": artist,
         "title": title,
         "tier": tier,
         "tierLabel": TIER_LABELS[tier],
-        "score": final_score,
-        "autoScore": auto_score,
         "bpm": bpm,
         "capo": capo,
         "bars": bar_count,
@@ -391,17 +332,14 @@ def build_single_py(
             ]
             if all((cache_entry / f).is_file() for f in req_files):
                 shutil.copytree(cache_entry, song_dir, dirs_exist_ok=True)
-                # Refresh path/score metadata cleanly if filename or folder changed
+                # Refresh path/metrics cleanly if filename or folder changed
                 mod = _load_module_direct(py_path)
                 measures = mod.build_measures()
                 manifest = json.loads((song_dir / cached["manifestFile"]).read_text(encoding="utf-8"))
-                info = analyze_and_score(
-                    norm_text,
+                info = analyze_score_metadata(
                     mod,
                     measures,
                     manifest,
-                    has_pdf=True,
-                    png_count=len(cached["pages"]),
                     artist_hint=artist_hint,
                     filename_stem=py_path.stem,
                 )
@@ -443,13 +381,10 @@ def build_single_py(
 
         mod = _load_module_direct(staged_py)
         measures = mod.build_measures()
-        info = analyze_and_score(
-            norm_text,
+        info = analyze_score_metadata(
             mod,
             measures,
             manifest,
-            has_pdf=True,
-            png_count=len(page_rels),
             artist_hint=artist_hint,
             filename_stem=py_path.stem,
         )
@@ -489,10 +424,9 @@ def _assemble_item(
         "title": info["title"],
         "tier": info["tier"],
         "tierLabel": info["tierLabel"],
-        "score": info["score"],
-        "autoScore": info["autoScore"],
         "bpm": info["bpm"],
         "capo": info["capo"],
+        "maxFret": info["maxFret"],
         "bars": info["bars"],
         "notes": info["notes"],
         "duration": meta["duration"],
@@ -517,9 +451,10 @@ def _write_pages_shell(out_dir: Path, catalog: Dict[str, Any]) -> None:
         title = html.escape(it["title"])
         tier_label = html.escape(it["tierLabel"])
         slug = urllib.parse.quote(it["slug"])
+        capo_txt = f"Capo {it['capo']}" if it.get("capo", 0) > 0 else "标准调弦"
         rows.append(
             f'<li><a href="{PLAYER_BASE_URL}?song={slug}">{artist} - {title}</a> '
-            f'<small>({tier_label} · {it["score"]}分 · {it["bars"]}小节)</small></li>'
+            f'<small>({tier_label} · {capo_txt} · 最高{it["maxFret"]}品 · {it["bars"]}小节)</small></li>'
         )
     list_html = "\n        ".join(rows) if rows else "<li>暂无曲目</li>"
     index_html = f"""<!DOCTYPE html>
@@ -608,7 +543,7 @@ def run_publish_mode(
         updated_at = existing_timestamps.get((rel_path, built["sha256"])) or now
         built["updatedAt"] = updated_at
         status_tag = "CACHED" if built.pop("cached", False) else "BUILT"
-        print(f"[{status_tag}] {rel_path} -> {built['songBase']} ({built['bars']} bars, {built['score']}分)")
+        print(f"[{status_tag}] {rel_path} -> {built['songBase']} ({built['tierLabel']}, {built['bars']} bars, 最高{built['maxFret']}品)")
 
         catalog_items.append(built)
         index_items.append(
@@ -618,10 +553,9 @@ def run_publish_mode(
                 "title": built["title"],
                 "tier": built["tier"],
                 "tierLabel": built["tierLabel"],
-                "score": built["score"],
-                "autoScore": built["autoScore"],
                 "bpm": built["bpm"],
                 "capo": built["capo"],
+                "maxFret": built["maxFret"],
                 "bars": built["bars"],
                 "notes": built["notes"],
                 "sha256": built["sha256"],
@@ -629,8 +563,8 @@ def run_publish_mode(
             }
         )
 
-    catalog_items.sort(key=lambda x: (x["artist"], x["title"], -x["score"], x["path"]))
-    index_items.sort(key=lambda x: (x["artist"], x["title"], -x["score"], x["path"]))
+    catalog_items.sort(key=lambda x: (x["artist"], x["title"], x["tier"], x["path"]))
+    index_items.sort(key=lambda x: (x["artist"], x["title"], x["tier"], x["path"]))
 
     catalog = {
         "version": 1,
@@ -713,14 +647,15 @@ def run_pr_mode(
                 )
                 suggest_path = (
                     f"scores/{built['artist']}/"
-                    f"{sanitize_segment(built['title'], 'Untitled')}_{built['tierLabel']}_{built['score']}分.py"
+                    f"{sanitize_segment(built['title'], 'Untitled')}_{built['tierLabel']}.py"
                 )
+                capo_txt = f"Capo {built['capo']}" if built["capo"] > 0 else "无变调夹"
                 status = "✅ 通过"
                 if rel_str.startswith("inbox/"):
                     status += f"（建议归档至 `{suggest_path}`）"
                 rows.append(
                     f"| `{rel_str}` | {built['artist']} | {built['title']} | {built['tierLabel']} | "
-                    f"{built['score']}分（自动 {built['autoScore']}） | {built['bars']} / {built['notes']} | "
+                    f"{capo_txt} / {built['maxFret']}品 | {built['bars']} / {built['notes']} | "
                     f"{built['crossings']} | {status} |"
                 )
             elif rel_str.startswith("inbox/") and ext in MIDI_OR_XML_EXTS:
@@ -744,15 +679,16 @@ def run_pr_mode(
                     )
                     suggest_path = (
                         f"scores/{built['artist']}/"
-                        f"{sanitize_segment(built['title'], 'Untitled')}_{built['tierLabel']}_{built['score']}分.py"
+                        f"{sanitize_segment(built['title'], 'Untitled')}_{built['tierLabel']}.py"
                     )
+                    capo_txt = f"Capo {built['capo']}" if built["capo"] > 0 else "无变调夹"
                     # Also expose converted score_data.py under out_dir/converted/<idx>/
                     conv_dir = out_dir / "converted" / f"{idx:02d}"
                     conv_dir.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(gen_py, conv_dir / Path(suggest_path).name)
                     rows.append(
                         f"| `{rel_str}` | {built['artist']} | {built['title']} | {built['tierLabel']} | "
-                        f"{built['autoScore']}分 | {built['bars']} / {built['notes']} | "
+                        f"{capo_txt} / {built['maxFret']}品 | {built['bars']} / {built['notes']} | "
                         f"{built['crossings']} | ✅ 已转源码并编译（可在 Artifact 下载 `{Path(suggest_path).name}` 并归档至 `{suggest_path}`） |"
                     )
             else:
@@ -767,7 +703,7 @@ def run_pr_mode(
         "<!-- guitar-tab-pr-report -->",
         "### 指弹谱库 PR 自动质检与云端试编报告",
         "",
-        "| 提交文件 | 歌手 | 曲目 | 档位 | 评分 | 小节 / 音符 | 声部交叉 | 状态 |",
+        "| 提交文件 | 歌手 | 曲目 | 档位 | Capo / 最高品 | 小节 / 音符 | 声部交叉 | 状态 |",
         "| :--- | :--- | :--- | :---: | :---: | :---: | :---: | :--- |",
         *rows,
         "",

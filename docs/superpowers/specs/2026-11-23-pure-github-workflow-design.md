@@ -12,8 +12,8 @@
 ## 架构概览
 
 - **投递与审核入口（PR）**
-  - 浏览器端保留 `score_data.py` 本地解析、SHA-256 预判重与四维自动评分（结构 /30 + 声部 /30 + 编配 /25 + 完整包 /15）。
-  - 用户确认歌手、曲名、档位与评分后，一键复制规范源码并跳转到 GitHub 原生新文件 PR 页面（`github.com/zxsos/guitar-tab-library/new/main?filename=scores/<歌手>/<曲名>_<档位>_<分数>分.py`）；贡献者亦可直接向 `scores/<歌手>/` 或 `inbox/<歌手>/` 提交 PR（支持 `.py` 及 `.mid`/`.musicxml`/`.mxl`）。
+  - 浏览器端保留 `score_data.py` 本地解析、SHA-256 预判重与把位/声部硬件信息提取（小节数、Capo、最高品格、声部交叉检查）。
+  - 用户确认歌手、曲名与档位后，一键复制规范源码并跳转到 GitHub 原生新文件 PR 页面（`github.com/zxsos/guitar-tab-library/new/main?filename=scores/<歌手>/<曲名>_<档位>.py`）；贡献者亦可直接向 `scores/<歌手>/` 或 `inbox/<歌手>/` 提交 PR（支持 `.py` 及 `.mid`/`.musicxml`/`.mxl`）。
 - **无权限 PR 试编门禁（`.github/workflows/pr-check.yml`）**
   - `build-and-verify` 任务仅持 `contents: read` 只读权限；
   - `scripts/build_library.py` 先在执行任何源码前跑静态安全门禁（限制 200 KB、拦截本地路径泄露、AST 与正则拦截系统/网络/动态执行模块），随后拉取 [fingerstyle-guitar-tab-skill](https://github.com/zxsos/fingerstyle-guitar-tab-skill) 引擎与 `lilypond`、`fluidsynth`、`ffmpeg`、`pdftoppm` 完成全套编译与四重质量校验；
