@@ -1,29 +1,33 @@
-# 部署 Cloudflare Worker（让任何访客上传都能自动存库）
+# 部署 Cloudflare Worker（已发布，仅差填入 GitHub Secret）
 
-只需一次性执行 3 步（完全免费额度，约 2 分钟）：
+Worker 已部署上线至 Cloudflare 账号 **`zcsos`**：
+- **线上接口**：`https://guitar-tab-library-worker.zcsos.workers.dev`
+- **入库模式**：`COMMIT_MODE = "direct"`（直接提交写入 `zxsos/guitar-tab-library` 的 `main` 分支）
+- **练习播放器**：已默认绑定上述地址
 
-### 第 1 步：生成最小权限的 GitHub Token
+---
+
+### 仅需 1 步私钥配置即可开启自动入库（2 分钟完成）
+
+出于安全原因，写入 GitHub 仓库的 Token 不能放进聊天或公开源码里，请由你本人私密写入 Cloudflare Secret：
+
+#### 1. 生成最小权限 GitHub Token
 1. 打开 GitHub **Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token**。
 2. **Repository access** 选 **Only select repositories** → 只勾选 **`zxsos/guitar-tab-library`**。
-3. **Permissions → Repository permissions** 只开：
-   - **Contents**: `Read and write`
-   - （可选，仅当你把 `COMMIT_MODE` 改成 `"pr"` 时需要）**Pull requests**: `Read and write`
-4. 复制生成的 Token。
+3. **Permissions → Repository permissions** 只将 **Contents** 设为 **`Read and write`**，生成并复制 Token。
 
-### 第 2 步：登录 Cloudflare 并写入密钥
-在 `worker/` 目录下执行：
+#### 2. 写入 Cloudflare Secret（二选一）
 
+**方式 A（网页端最省事）：**
+1. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com/) → 右上角切换到 **`zcsos`** 账号。
+2. 进入 **Workers & Pages → `guitar-tab-library-worker` → Settings → Variables and Secrets**。
+3. 点 **Add → Secret**：Name 填 `GITHUB_TOKEN`，Value 粘贴刚才的 Token，点击 **Deploy**。
+
+**方式 B（本地终端命令行）：**
 ```bash
+cd /path/to/guitar-tab-library/worker
 npx wrangler login
-npx wrangler secret put GITHUB_TOKEN   # 粘贴第 1 步的 Token
+npx wrangler secret put GITHUB_TOKEN
 ```
 
-### 第 3 步：部署并绑定到播放器
-
-```bash
-npx wrangler deploy
-```
-
-部署完成后终端会打印你的 Worker 地址（例如 `https://guitar-tab-library-worker.<你的子域>.workers.dev`）：
-- 在练习播放器导入弹窗的「接口设置」里填入该地址（立即生效）；
-- 或者把该地址写进 `guitar-tab-player/index.html` 的 `DEFAULT_LIBRARY_WORKER_URL` 并推送，所有访客即可免配置直接使用。
+配置完成后访问 `https://guitar-tab-library-worker.zcsos.workers.dev/health`，看到 `"configured": true` 即表示所有访客上传都会自动分类存库。

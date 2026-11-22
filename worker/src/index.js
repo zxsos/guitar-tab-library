@@ -216,11 +216,19 @@ export async function handleRequest(request, env = {}) {
   }
 
   if (request.method === "GET" && url.pathname === "/catalog") {
-    const res = await ghApi(fetchFn, env.GITHUB_TOKEN, `/repos/${owner}/${repo}/contents/index.json?ref=${encodeURIComponent(branch)}`);
-    if (!res.ok) {
-      return jsonResponse({ ok: false, error: res.data?.message || "无法读取谱库索引" }, res.status, cors);
+    if (env.GITHUB_TOKEN) {
+      const res = await ghApi(fetchFn, env.GITHUB_TOKEN, `/repos/${owner}/${repo}/contents/index.json?ref=${encodeURIComponent(branch)}`);
+      if (res.ok && res.data?.content) {
+        const parsed = JSON.parse(decodeBase64Utf8(res.data.content));
+        return jsonResponse(parsed, 200, cors);
+      }
     }
-    const parsed = JSON.parse(decodeBase64Utf8(res.data.content));
+    const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${encodeURIComponent(branch)}/index.json`;
+    const rawResp = await fetchFn(rawUrl, { headers: { "User-Agent": "guitar-tab-library-worker/1.0" } });
+    if (!rawResp.ok) {
+      return jsonResponse({ ok: false, error: `无法读取谱库索引 (${rawResp.status})` }, rawResp.status, cors);
+    }
+    const parsed = await rawResp.json();
     return jsonResponse(parsed, 200, cors);
   }
 
