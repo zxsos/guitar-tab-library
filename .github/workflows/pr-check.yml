@@ -1,0 +1,119 @@
+name: PR Check & Auto Compile
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'scores/**/*.py'
+      - 'inbox/**'
+      - 'scripts/build_library.py'
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      head_repo: ${{ github.event.pull_request.head.repo.full_name }}
+    steps:
+      - name: Checkout library PR
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout skill engine
+        uses: actions/checkout@v4
+        with:
+          repository: zxsos/fingerstyle-guitar-tab-skill
+          path: _skill
+
+      - name: Install engraving & audio toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            lilypond fluidsynth fluid-soundfont-gm ffmpeg ghostscript poppler-utils fonts-noto-cjk
+
+      - name: Detect changed score files
+        id: changed
+        run: |
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          mapfile -d '' -t FILES < <(git -c core.quotePath=false diff --name-only -z --diff-filter=AM "$BASE_SHA" "$HEAD_SHA" -- scores inbox || true)
+          python3 -c 'import json,sys; print("files=" + json.dumps([x for x in sys.argv[1:] if x]))' "${FILES[@]}" >> "$GITHUB_OUTPUT"
+
+      - name: Run static security gate & full build
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess, sys
+          files = json.loads(os.environ.get("CHANGED_FILES_JSON", "[]"))
+          cmd = [
+              sys.executable,
+              "scripts/build_library.py",
+              "--mode", "pr",
+              "--skill-scripts", "_skill/skills/fingerstyle-guitar-tab/scripts",
+              "--out-dir", "_pr_out",
+              "--report-out", "pr_report.md",
+          ]
+          if files:
+              cmd.extend(["--files", *files])
+          raise SystemExit(subprocess.call(cmd))
+          PY
+        env:
+          CHANGED_FILES_JSON: ${{ steps.changed.outputs.files }}
+
+      - name: Append summary & upload preview bundle
+        if: always()
+        run: |
+          if [ -f pr_report.md ]; then
+            cat pr_report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload PR build report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-report
+          path: pr_report.md
+          if-no-files-found: ignore
+
+      - name: Upload compiled PDF / PNG / MP3 artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-compiled-preview
+          path: _pr_out
+          if-no-files-found: ignore
+
+  comment-pr:
+    needs: build-and-verify
+    if: always() && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Download PR report
+        uses: actions/download-artifact@v4
+        with:
+          name: pr-report
+          path: .
+
+      - name: Post or update PR comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require("fs");
+            if (!fs.existsSync("pr_report.md")) return;
+            const body = fs.readFileSync("pr_report.md", "utf8");
+            const marker = "<!-- guitar-tab-pr-report -->";
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.rest.issues.listComments({ owner, repo, issue_number, per_page: 50 });
+            const existing = comments.data.find((c) => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }

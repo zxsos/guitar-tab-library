@@ -1,0 +1,8 @@
+_skill/
+_site/
+_pr_out/
+.build-cache/
+pr_report.md
+__pycache__/
+*.pyc
+.DS_Store

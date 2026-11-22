@@ -1,0 +1,83 @@
+name: Build & Publish Library Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scores/**/*.py'
+      - 'scripts/build_library.py'
+      - '.github/workflows/publish-library.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout library repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout skill engine
+        uses: actions/checkout@v4
+        with:
+          repository: zxsos/fingerstyle-guitar-tab-skill
+          path: _skill
+
+      - name: Restore incremental build cache
+        uses: actions/cache@v4
+        with:
+          path: .build-cache
+          key: lib-build-cache-v1-${{ hashFiles('scores/**/*.py', 'scripts/build_library.py') }}
+          restore-keys: |
+            lib-build-cache-v1-
+
+      - name: Install engraving & audio toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            lilypond fluidsynth fluid-soundfont-gm ffmpeg ghostscript poppler-utils fonts-noto-cjk
+
+      - name: Incremental build & package _site
+        run: |
+          python3 scripts/build_library.py \
+            --mode publish \
+            --skill-scripts _skill/skills/fingerstyle-guitar-tab/scripts \
+            --out-dir _site \
+            --cache-dir .build-cache \
+            --write-index
+
+      - name: Refresh index.json on main if changed
+        run: |
+          if ! git diff --quiet index.json; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add index.json
+            git commit -m "chore: refresh index.json [skip ci]"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
