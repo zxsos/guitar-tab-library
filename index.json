@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "updatedAt": "2026-11-23T05:15:00.000Z",
+  "items": [
+    {
+      "path": "scores/泽野弘之/Call_of_Silence_标准_96分.py",
+      "artist": "泽野弘之",
+      "title": "Call of Silence",
+      "tier": "standard",
+      "tierLabel": "标准",
+      "score": 96,
+      "autoScore": 96,
+      "bpm": 72,
+      "capo": 2,
+      "bars": 45,
+      "notes": 602,
+      "sha256": "c9fbc7e64e277e6ee4180cc9d2c9a9f7f1509550a0c800f3f65f0880c80f2d0f",
+      "updatedAt": "2026-11-23T05:15:00.000Z"
+    }
+  ]
+}

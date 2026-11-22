@@ -1,0 +1,10 @@
+name = "guitar-tab-library-worker"
+main = "src/index.js"
+compatibility_date = "2026-01-01"
+
+[vars]
+GITHUB_OWNER = "zxsos"
+GITHUB_REPO = "guitar-tab-library"
+GITHUB_BRANCH = "main"
+COMMIT_MODE = "direct" # 可改为 "pr" 以 Pull Request 方式审核入库
+ALLOWED_ORIGINS = "https://zxsos.github.io"
