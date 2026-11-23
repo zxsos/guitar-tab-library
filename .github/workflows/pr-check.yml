@@ -117,3 +117,54 @@ jobs:
             } else {
               await github.rest.issues.createComment({ owner, repo, issue_number, body });
             }
+
+  auto-merge:
+    needs: build-and-verify
+    if: >-
+      success() &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Auto-merge verified score PR into main
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const pull_number = context.issue.number;
+            const headRef = context.payload.pull_request.head.ref;
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner,
+              repo,
+              pull_number,
+              per_page: 100,
+            });
+            const scoreOnly =
+              files.length > 0 &&
+              files.every((f) => /^scores\/[^/]+\/[^/]+\.py$/.test(f.filename) && f.status !== "removed");
+
+            if (!scoreOnly) {
+              core.info("Skipping auto-merge: PR modifies files outside scores/<artist>/*.py.");
+              return;
+            }
+
+            await github.rest.pulls.merge({
+              owner,
+              repo,
+              pull_number,
+              merge_method: "squash",
+            });
+            core.info(`Merged PR #${pull_number} into main.`);
+
+            if (headRef && headRef.startsWith("submit/")) {
+              try {
+                await github.rest.git.deleteRef({ owner, repo, ref: `heads/${headRef}` });
+                core.info(`Deleted branch ${headRef}.`);
+              } catch (err) {
+                core.warning(`Failed to delete branch ${headRef}: ${err.message}`);
+              }
+            }

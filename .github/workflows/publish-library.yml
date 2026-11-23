@@ -7,6 +7,9 @@ on:
       - 'scores/**/*.py'
       - 'scripts/build_library.py'
       - '.github/workflows/publish-library.yml'
+  workflow_run:
+    workflows: ["PR Check & Auto Compile"]
+    types: [completed]
   workflow_dispatch:
 
 permissions:
@@ -20,11 +23,13 @@ concurrency:
 
 jobs:
   build:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout library repository
         uses: actions/checkout@v4
         with:
+          ref: main
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Checkout skill engine
