@@ -24,6 +24,7 @@ REPO_SLUG = "zxsos/guitar-tab-library"
 GITHUB_BLOB_BASE = f"https://github.com/{REPO_SLUG}/blob/main"
 PLAYER_BASE_URL = "https://zxsos.github.io/guitar-tab-player/"
 OPEN_TUNING_NO_CAPO: Dict[int, int] = {6: 40, 5: 45, 4: 50, 3: 55, 2: 59, 1: 64}
+GUITAR_SCALE_CM = 65.0
 
 MAX_PY_BYTES = 204_800  # 200 KB
 MAX_BINARY_SCORE_BYTES = 5 * 1024 * 1024  # 5 MB for MIDI / MusicXML inbox files
@@ -145,6 +146,15 @@ def _load_module_direct(py_path: Path) -> Any:
     return mod
 
 
+def finger_pos_cm(abs_fret: int) -> float:
+    """Physical distance (cm) from guitar nut to finger placement center at absolute fret."""
+    if abs_fret <= 0:
+        return 0.0
+    p0 = GUITAR_SCALE_CM * (1.0 - 2.0 ** (-(abs_fret - 1) / 12.0))
+    p1 = GUITAR_SCALE_CM * (1.0 - 2.0 ** (-abs_fret / 12.0))
+    return 0.5 * (p0 + p1)
+
+
 def analyze_score_metadata(
     mod: Any,
     measures: List[Any],
@@ -153,7 +163,7 @@ def analyze_score_metadata(
     artist_hint: str = "",
     filename_stem: str = "",
 ) -> Dict[str, Any]:
-    """Infer artist/title/tier and extract factual guitar/tab metrics."""
+    """Infer artist/title/tier and compute physical playability score (0-100) + difficulty (1.0-10.0)."""
     title_from_name = ""
     tier_from_name = ""
     m_fn = FILENAME_RE.match(filename_stem)
@@ -186,32 +196,102 @@ def analyze_score_metadata(
 
     max_fret = 0
     note_count = 0
+    pitched_count = 0
+    non_rest_events = 0
+    poly_events = 0
+    max_simul = 0
     harm_count = 0
     pm_count = 0
     grace_count = 0
     slap_count = 0
     link_count = 0
     arp_count = 0
-    has_16th = False
+    sixteenth_events = 0
+    tech_events = 0
+
+    spans_cm: List[float] = []
+    extreme_stretches: List[Tuple[int, float, int, int]] = []
+    hard_stretches = 0
+    impossible_chords: List[Tuple[int, int]] = []
+    barre_events = 0
+    awkward_shifts: List[Tuple[int, int, int, float]] = []
+    large_shifts = 0
+    shift_transitions = 0
+    shift_velocities: List[float] = []
+
+    non_pickup_bars = 0
+    bass_bars = 0
+    chord_bars = 0
+    empty_bars = 0
+    bar_slot_sums: List[int] = []
+    bar_nps_list: List[float] = []
+    distinct_bass: Set[int] = set()
+    sections: Set[str] = set()
+    dynamics: Set[float] = set()
 
     last_bar = measures[-1].bar if measures else 0
     active_mel: Optional[int] = None
     crossings = 0
 
+    prev_anchor_cm: Optional[float] = None
+    prev_mean_fret: Optional[float] = None
+    elapsed_since_fretted_slots = 0
+    total_slots = 0
+    sec_per_slot = (60.0 / max(30, bpm)) / 4.0
+
     for meas in measures:
         events = getattr(meas, "events", []) or []
+        is_pickup = bool(getattr(meas, "is_pickup", False))
+        sec_label = getattr(meas, "section", None)
+        if sec_label:
+            sections.add(str(sec_label).strip())
+        dynamics.add(round(float(getattr(meas, "dynamic", 1.0) or 1.0), 2))
+
+        if not is_pickup:
+            non_pickup_bars += 1
+            if getattr(meas, "chords", None):
+                chord_bars += 1
+            if not events:
+                empty_bars += 1
+
+        bar_has_bass = False
+        bar_pitched = 0
+        bar_dur_sum = 0
+
         for ev_idx, e in enumerate(events):
-            if getattr(e, "dur", 0) == 1:
-                has_16th = True
+            dur = max(1, int(getattr(e, "dur", 2) or 2))
+            bar_dur_sum += dur
+            total_slots += dur
+
+            if dur == 1:
+                sixteenth_events += 1
+            ev_has_tech = False
             if getattr(e, "arpeggio", False):
                 arp_count += 1
+                ev_has_tech = True
             if getattr(e, "link_tech", None) in ("H", "P", "S"):
                 link_count += 1
+                ev_has_tech = True
+
             if getattr(e, "rest", False):
                 active_mel = None
+                elapsed_since_fretted_slots += dur
                 continue
+
             notes = getattr(e, "notes", ()) or ()
+            if not notes:
+                elapsed_since_fretted_slots += dur
+                continue
+
+            non_rest_events += 1
             pitched = [nt for nt in notes if getattr(nt, "role", "melody") != "slap"]
+            pitched_count += len(pitched)
+            bar_pitched += len(pitched)
+            if len(pitched) >= 2:
+                poly_events += 1
+            if len(pitched) > max_simul:
+                max_simul = len(pitched)
+
             mels = [nt for nt in pitched if getattr(nt, "role", "melody") == "melody"]
             if mels:
                 if any(getattr(nt, "harmonic", False) for nt in mels):
@@ -228,20 +308,82 @@ def analyze_score_metadata(
                         if cm > active_mel:
                             crossings += 1
 
+            fretted: List[Tuple[int, int]] = []
             for nt in notes:
                 note_count += 1
                 role = getattr(nt, "role", "melody")
                 is_harm = bool(getattr(nt, "harmonic", False))
-                if not is_harm and role != "slap" and nt.fret > max_fret:
-                    max_fret = nt.fret
-                if role == "slap":
+                if not is_harm and role != "slap":
+                    if nt.fret > max_fret:
+                        max_fret = nt.fret
+                    if nt.fret > 0:
+                        fretted.append((nt.string, nt.fret))
+                if role == "bass":
+                    bar_has_bass = True
+                    distinct_bass.add(OPEN_TUNING_NO_CAPO[nt.string] + capo + nt.fret)
+                elif role == "slap":
                     slap_count += 1
+                    ev_has_tech = True
                 if is_harm:
                     harm_count += 1
+                    ev_has_tech = True
                 if getattr(nt, "palm_mute", False):
                     pm_count += 1
+                    ev_has_tech = True
                 if getattr(nt, "grace_from", None) is not None:
                     grace_count += 1
+                    ev_has_tech = True
+
+            if ev_has_tech:
+                tech_events += 1
+
+            uniq_fretted = sorted(set(fretted))
+            if uniq_fretted:
+                frets_only = [f for _, f in uniq_fretted]
+                min_f, max_f = min(frets_only), max(frets_only)
+                at_min = [s for s, f in uniq_fretted if f == min_f]
+                k = len(uniq_fretted)
+                fingers_needed = (k - len(at_min) + 1) if len(at_min) >= 2 else k
+                if fingers_needed > 4:
+                    impossible_chords.append((meas.bar, fingers_needed))
+                if (k >= 4 and len(at_min) >= 2) or (
+                    k >= 3 and len(at_min) >= 2 and (max(at_min) - min(at_min)) >= 2
+                ):
+                    barre_events += 1
+
+                if max_f > min_f:
+                    span = finger_pos_cm(capo + max_f) - finger_pos_cm(capo + min_f)
+                    spans_cm.append(span)
+                    if span > 14.5:
+                        extreme_stretches.append((meas.bar, round(span, 1), min_f, max_f))
+                    elif span > 12.5:
+                        hard_stretches += 1
+
+                anchor = sum(finger_pos_cm(capo + f) for f in frets_only) / len(frets_only)
+                mean_f = sum(frets_only) / len(frets_only)
+                if prev_anchor_cm is not None and prev_mean_fret is not None:
+                    dt = max(0.06, elapsed_since_fretted_slots * sec_per_slot)
+                    shift_cm = abs(anchor - prev_anchor_cm)
+                    fjump = abs(mean_f - prev_mean_fret)
+                    shift_transitions += 1
+                    shift_velocities.append(shift_cm / dt)
+                    if fjump >= 4:
+                        large_shifts += 1
+                    if fjump >= 5 and shift_cm >= 12.0 and dt <= 0.28:
+                        awkward_shifts.append((meas.bar, int(round(prev_mean_fret)), int(round(mean_f)), round(dt, 2)))
+                prev_anchor_cm = anchor
+                prev_mean_fret = mean_f
+                elapsed_since_fretted_slots = dur
+            else:
+                elapsed_since_fretted_slots += dur
+
+        if not is_pickup:
+            if bar_has_bass:
+                bass_bars += 1
+            if bar_dur_sum > 0:
+                bar_slot_sums.append(bar_dur_sum)
+            bar_sec = max(0.25, (bar_dur_sum or 16) * sec_per_slot)
+            bar_nps_list.append(bar_pitched / bar_sec)
 
     tech_variety = sum(
         1
@@ -256,14 +398,122 @@ def analyze_score_metadata(
         if flag
     )
 
+    # 1. Left-hand Playability (0..40)
+    fretted_events_est = max(1, shift_transitions + 1)
+    excess_hard = max(0, hard_stretches - int(fretted_events_est * 0.05))
+    playability_f = 40.0
+    playability_f -= min(18.0, len(impossible_chords) * 6.0)
+    playability_f -= min(14.0, len(extreme_stretches) * 3.5)
+    playability_f -= min(6.0, excess_hard * 0.8)
+    playability_f -= min(8.0, len(awkward_shifts) * 1.5)
+    playability_f -= min(10.0, crossings * 1.2)
+    if max_fret > 17:
+        playability_f -= 2.0
+    playability_pts = max(0, min(40, int(round(playability_f))))
+
+    # 2. Arrangement Richness (0..35)
+    bass_ratio = bass_bars / max(1, non_pickup_bars)
+    pts_bass = min(9.0, bass_ratio * 10.5) + min(2.0, len(distinct_bass) * 0.4)
+    avg_poly = pitched_count / max(1, non_rest_events)
+    poly_ratio = poly_events / max(1, non_rest_events)
+    pts_poly = min(6.0, max(0.0, (avg_poly - 1.0) * 8.0)) + min(4.0, poly_ratio * 10.0)
+    pts_tech = min(6.0, tech_variety * 1.6) + min(2.0, (tech_events / max(1, non_rest_events)) * 18.0)
+    pts_struct = (
+        min(3.0, len(sections) * 1.0)
+        + min(2.0, max(0, len(dynamics) - 1) * 0.8)
+        + (1.0 if non_pickup_bars >= 16 else (0.5 if non_pickup_bars >= 8 else 0.0))
+    )
+    arrangement_pts = max(0, min(35, int(round(pts_bass + pts_poly + pts_tech + pts_struct))))
+
+    # 3. Notation Quality (0..25)
+    if bar_slot_sums:
+        dom_slots = max(set(bar_slot_sums), key=bar_slot_sums.count)
+        aligned_bars = sum(1 for s in bar_slot_sums if s == dom_slots)
+        unaligned_bars = max(0, non_pickup_bars - aligned_bars)
+        aligned_ratio = aligned_bars / max(1, non_pickup_bars)
+    else:
+        unaligned_bars = non_pickup_bars
+        aligned_ratio = 0.0
+    chord_ratio = chord_bars / max(1, non_pickup_bars)
+    has_title = bool(title and title != "Untitled")
+    has_artist = bool(artist and artist != "未分类")
+    has_setup = hasattr(mod, "CAPO") or bool(getattr(mod, "ARRANGER_INFO", ""))
+    pts_meta = (
+        (1.5 if has_title else 0.0)
+        + (1.5 if has_artist else 0.0)
+        + (1.0 if bpm > 0 else 0.0)
+        + (1.0 if has_setup else 0.0)
+    )
+    pts_clean = max(0.0, 3.0 - empty_bars * 1.0 - (1.5 if non_pickup_bars < 4 else 0.0))
+    notation_pts = max(0, min(25, int(round(aligned_ratio * 10.0 + min(7.0, chord_ratio * 7.8) + pts_meta + pts_clean))))
+
+    quality_score = max(0, min(100, playability_pts + arrangement_pts + notation_pts))
+
+    # Actionable diagnostics (top 5)
+    issues: List[str] = []
+    if impossible_chords:
+        b0, f0 = impossible_chords[0]
+        extra = f" 等 {len(impossible_chords)} 处" if len(impossible_chords) > 1 else ""
+        issues.append(f"M{b0:02d}{extra} 同拍需 {f0} 指（超出左手可行范围）")
+    if extreme_stretches:
+        b0, sp0, mf0, xf0 = extreme_stretches[0]
+        extra = f" 等 {len(extreme_stretches)} 处" if len(extreme_stretches) > 1 else ""
+        issues.append(f"M{b0:02d}{extra} 左手跨度 {sp0:.1f}cm 过宽（{mf0}–{xf0}品）")
+    if awkward_shifts:
+        b0, pf0, nf0, dt0 = awkward_shifts[0]
+        extra = f" 等 {len(awkward_shifts)} 处" if len(awkward_shifts) > 1 else ""
+        issues.append(f"M{b0:02d}{extra} 快速大跳把位（{pf0}品→{nf0}品，{dt0:.2f}s）")
+    if crossings > 0:
+        issues.append(f"{crossings} 处声部交叉（伴奏高于旋律）")
+    if non_pickup_bars >= 4 and bass_ratio < 0.5:
+        issues.append(f"低音声部覆盖偏低（{int(round(bass_ratio * 100))}%）")
+    if non_pickup_bars >= 4 and chord_ratio < 0.5:
+        issues.append(f"和弦标记不足（{int(round(chord_ratio * 100))}%）")
+    if unaligned_bars > 0:
+        issues.append(f"{unaligned_bars} 个小节拍数未对齐")
+    issues = issues[:5]
+
+    # 4. Difficulty Index (Lv. 1.0 .. 10.0)
+    dur_sec = max(1.0, total_slots * sec_per_slot)
+    nps = pitched_count / dur_sec
+    sorted_bnps = sorted(bar_nps_list) if bar_nps_list else [nps]
+    p90_nps = sorted_bnps[min(len(sorted_bnps) - 1, int(len(sorted_bnps) * 0.9))]
+    eff_nps = 0.55 * nps + 0.45 * p90_nps
+    ratio_16th = sixteenth_events / max(1, non_rest_events)
+    d_speed = min(
+        3.0,
+        max(0.0, (eff_nps - 1.0) * 0.42)
+        + (0.35 if ratio_16th >= 0.08 else (0.15 if sixteenth_events > 0 else 0.0)),
+    )
+
+    sorted_spans = sorted(spans_cm) if spans_cm else [0.0]
+    p95_span = sorted_spans[min(len(sorted_spans) - 1, int(len(sorted_spans) * 0.95))]
+    barre_ratio = barre_events / max(1, non_rest_events)
+    d_hand = min(
+        2.2,
+        min(1.3, max(0.0, (p95_span - 6.0) * 0.16)) + min(0.9, barre_ratio * 4.5),
+    )
+
+    avg_shift_vel = sum(shift_velocities) / max(1, len(shift_velocities))
+    large_shift_ratio = large_shifts / max(1, shift_transitions)
+    d_neck = min(
+        1.8,
+        min(0.9, max(0.0, (max_fret - 3) * 0.075))
+        + min(0.9, large_shift_ratio * 3.0 + min(0.45, avg_shift_vel / 25.0)),
+    )
+
+    d_poly = min(1.4, max(0.0, (avg_poly - 1.0) * 1.1) + (0.3 if max_simul >= 4 else 0.0))
+    d_tech = min(1.2, tech_variety * 0.18 + min(0.5, (tech_events / max(1, non_rest_events)) * 2.5))
+    difficulty = round(min(10.0, max(1.0, 1.0 + d_speed + d_hand + d_neck + d_poly + d_tech)), 1)
+
     explicit_tier = str(getattr(mod, "TIER", "") or "").strip().lower()
     if explicit_tier in TIER_LABELS:
         tier = explicit_tier
     elif tier_from_name in TIER_LABELS:
         tier = tier_from_name
-    elif max_fret > 12:
+    elif difficulty >= 7.0 or max_fret > 12:
         tier = "advanced"
-    elif has_16th or tech_variety >= 1 or max_fret > 7:
+    elif difficulty >= 3.5 or sixteenth_events > 0 or tech_variety >= 1 or max_fret > 7:
         tier = "standard"
     else:
         tier = "beginner"
@@ -283,6 +533,14 @@ def analyze_score_metadata(
         "notes": total_notes,
         "maxFret": max_fret,
         "crossings": crossings,
+        "qualityScore": quality_score,
+        "scoreBreakdown": {
+            "playability": playability_pts,
+            "arrangement": arrangement_pts,
+            "notation": notation_pts,
+        },
+        "scoreIssues": issues,
+        "difficulty": difficulty,
     }
 
 
@@ -431,6 +689,10 @@ def _assemble_item(
         "notes": info["notes"],
         "duration": meta["duration"],
         "crossings": info["crossings"],
+        "qualityScore": info["qualityScore"],
+        "scoreBreakdown": info["scoreBreakdown"],
+        "scoreIssues": info["scoreIssues"],
+        "difficulty": info["difficulty"],
         "sha256": sha256,
         "songBase": f"songs/{slug}/",
         "manifestFile": meta["manifestFile"],
@@ -452,9 +714,12 @@ def _write_pages_shell(out_dir: Path, catalog: Dict[str, Any]) -> None:
         tier_label = html.escape(it["tierLabel"])
         slug = urllib.parse.quote(it["slug"])
         capo_txt = f"Capo {it['capo']}" if it.get("capo", 0) > 0 else "标准调弦"
+        lv_txt = f"Lv.{it['difficulty']:.1f}" if it.get("difficulty") is not None else ""
+        sc_txt = f"{it['qualityScore']}分" if it.get("qualityScore") is not None else ""
+        extra = " · ".join(x for x in (tier_label, lv_txt, sc_txt, capo_txt, f"最高{it['maxFret']}品") if x)
         rows.append(
             f'<li><a href="{PLAYER_BASE_URL}?song={slug}">{artist} - {title}</a> '
-            f'<small>({tier_label} · {capo_txt} · 最高{it["maxFret"]}品 · {it["bars"]}小节)</small></li>'
+            f'<small>({extra})</small></li>'
         )
     list_html = "\n        ".join(rows) if rows else "<li>暂无曲目</li>"
     index_html = f"""<!DOCTYPE html>
@@ -543,7 +808,10 @@ def run_publish_mode(
         updated_at = existing_timestamps.get((rel_path, built["sha256"])) or now
         built["updatedAt"] = updated_at
         status_tag = "CACHED" if built.pop("cached", False) else "BUILT"
-        print(f"[{status_tag}] {rel_path} -> {built['songBase']} ({built['tierLabel']}, {built['bars']} bars, 最高{built['maxFret']}品)")
+        print(
+            f"[{status_tag}] {rel_path} -> {built['songBase']} "
+            f"({built['tierLabel']}, {built['qualityScore']}分, Lv.{built['difficulty']:.1f}, {built['bars']} bars)"
+        )
 
         catalog_items.append(built)
         index_items.append(
@@ -558,6 +826,8 @@ def run_publish_mode(
                 "maxFret": built["maxFret"],
                 "bars": built["bars"],
                 "notes": built["notes"],
+                "qualityScore": built["qualityScore"],
+                "difficulty": built["difficulty"],
                 "sha256": built["sha256"],
                 "updatedAt": updated_at,
             }
@@ -613,6 +883,7 @@ def run_pr_mode(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     rows: List[str] = []
+    diag_notes: List[str] = []
     failures: List[str] = []
 
     if not targets:
@@ -650,14 +921,18 @@ def run_pr_mode(
                     f"{sanitize_segment(built['title'], 'Untitled')}_{built['tierLabel']}.py"
                 )
                 capo_txt = f"Capo {built['capo']}" if built["capo"] > 0 else "无变调夹"
+                bd = built["scoreBreakdown"]
+                score_cell = f"**{built['qualityScore']}** ({bd['playability']}/{bd['arrangement']}/{bd['notation']})"
+                diff_cell = f"Lv.{built['difficulty']:.1f}"
                 status = "✅ 通过"
                 if rel_str.startswith("inbox/"):
                     status += f"（建议归档至 `{suggest_path}`）"
                 rows.append(
-                    f"| `{rel_str}` | {built['artist']} | {built['title']} | {built['tierLabel']} | "
-                    f"{capo_txt} / {built['maxFret']}品 | {built['bars']} / {built['notes']} | "
-                    f"{built['crossings']} | {status} |"
+                    f"| `{rel_str}` | {built['artist']} - {built['title']} ({built['tierLabel']}) | "
+                    f"{score_cell} | {diff_cell} | {capo_txt} / {built['maxFret']}品 | {status} |"
                 )
+                if built.get("scoreIssues"):
+                    diag_notes.append(f"- `{rel_str}`: " + "；".join(built["scoreIssues"]))
             elif rel_str.startswith("inbox/") and ext in MIDI_OR_XML_EXTS:
                 if fpath.stat().st_size > MAX_BINARY_SCORE_BYTES:
                     raise ValueError(f"{fpath.name}: 体积超过 5 MB 上限")
@@ -682,32 +957,38 @@ def run_pr_mode(
                         f"{sanitize_segment(built['title'], 'Untitled')}_{built['tierLabel']}.py"
                     )
                     capo_txt = f"Capo {built['capo']}" if built["capo"] > 0 else "无变调夹"
-                    # Also expose converted score_data.py under out_dir/converted/<idx>/
+                    bd = built["scoreBreakdown"]
+                    score_cell = f"**{built['qualityScore']}** ({bd['playability']}/{bd['arrangement']}/{bd['notation']})"
+                    diff_cell = f"Lv.{built['difficulty']:.1f}"
                     conv_dir = out_dir / "converted" / f"{idx:02d}"
                     conv_dir.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(gen_py, conv_dir / Path(suggest_path).name)
                     rows.append(
-                        f"| `{rel_str}` | {built['artist']} | {built['title']} | {built['tierLabel']} | "
-                        f"{capo_txt} / {built['maxFret']}品 | {built['bars']} / {built['notes']} | "
-                        f"{built['crossings']} | ✅ 已转源码并编译（可在 Artifact 下载 `{Path(suggest_path).name}` 并归档至 `{suggest_path}`） |"
+                        f"| `{rel_str}` | {built['artist']} - {built['title']} ({built['tierLabel']}) | "
+                        f"{score_cell} | {diff_cell} | {capo_txt} / {built['maxFret']}品 | "
+                        f"✅ 已转源码并编译（可在 Artifact 下载 `{Path(suggest_path).name}` 并归档至 `{suggest_path}`） |"
                     )
+                    if built.get("scoreIssues"):
+                        diag_notes.append(f"- `{rel_str}`: " + "；".join(built["scoreIssues"]))
             else:
                 raise ValueError(f"不支持的文件类型或路径 '{rel_str}'（请放到 scores/<歌手>/*.py 或 inbox/<歌手>/*.mid|.musicxml|.mxl）")
         except Exception as exc:
             err_msg = str(exc).splitlines()[0][:240]
             failures.append(f"- `{rel_str}`: {err_msg}")
-            rows.append(f"| `{rel_str}` | {artist_hint} | - | - | - | - | - | ❌ 失败 |")
+            rows.append(f"| `{rel_str}` | {artist_hint} | - | - | - | ❌ 失败 |")
             print(f"[FAIL] {rel_str}: {exc}", file=sys.stderr)
 
     lines = [
         "<!-- guitar-tab-pr-report -->",
         "### 指弹谱库 PR 自动质检与云端试编报告",
         "",
-        "| 提交文件 | 歌手 | 曲目 | 档位 | Capo / 最高品 | 小节 / 音符 | 声部交叉 | 状态 |",
-        "| :--- | :--- | :--- | :---: | :---: | :---: | :---: | :--- |",
+        "| 提交文件 | 曲目 | 评分 (手型/编配/规范) | 难度 | Capo / 最高品 | 状态 |",
+        "| :--- | :--- | :---: | :---: | :---: | :--- |",
         *rows,
         "",
     ]
+    if diag_notes:
+        lines.extend(["#### 谱面物理手型与编配诊断", "", *diag_notes, ""])
     if failures:
         lines.extend(["#### 错误详情", "", *failures, ""])
     else:
